@@ -34,13 +34,20 @@ jobs:
 
       - name: Install WARP
         run: |
-          wget https://raw.githubusercontent.com/fscarmen/warp-on-actions/main/warp.sh -O warp.sh
-          bash warp.sh
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
 
       - name: Run Python script
         env:
           USERNAMES: ${{ secrets.USERNAMES }}
           PASSWORDS: ${{ secrets.PASSWORDS }}
+          WISPBYTE_1: ${{ secrets.WISPBYTE_1 }}
+          WISPBYTE_2: ${{ secrets.WISPBYTE_2 }}
+          WISPBYTE_3: ${{ secrets.WISPBYTE_3 }}
+          WISPBYTE_4: ${{ secrets.WISPBYTE_4 }}
+          WISPBYTE_5: ${{ secrets.WISPBYTE_5 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python main.py
