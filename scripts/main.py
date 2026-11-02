@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import List, Tuple, Optional
 
 import requests
@@ -65,6 +66,22 @@ def log(msg: str, level: str = "INFO"):
     logger.info(f"{prefix} {msg}")
 
 
+def is_ad_or_reward_url(url: str) -> bool:
+    """判断当前 URL 的主路径是否为广告/奖励视频页面（忽略 ?return= 参数）"""
+    if not url:
+        return False
+    path = urlparse(url).path.lower()
+    return any(kw in path for kw in ("reward-video", "reward_video", "venatus-reward", "reward"))
+
+
+def is_console_url(url: str, identifier: str) -> bool:
+    """判断当前 URL 的主路径是否真正回到了控制台页面（忽略 ?return= 参数）"""
+    if not url:
+        return False
+    path = urlparse(url).path
+    return f"/servers/{identifier}/console" in path
+
+
 def send_tg_photo(token: str, chat_id: str, photo_path: str, caption: str):
     if not token or not chat_id:
         return
@@ -86,33 +103,63 @@ def send_tg_photo(token: str, chat_id: str, photo_path: str, caption: str):
         log(f"Telegram 通知异常: {e}", "ERROR")
 
 
+def _safe_warp_cmd(args: List[str], timeout: int = 12) -> bool:
+    """带严格超时与非交互输入保护的 warp-cli 调用，防止进程卡死"""
+    try:
+        res = subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos"] + args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False
+        )
+        return res.returncode == 0
+    except subprocess.TimeoutExpired:
+        log(f"warp-cli {' '.join(args)} 超时 ({timeout}s)，跳过...", "WARN")
+        return False
+    except Exception as e:
+        log(f"warp-cli {' '.join(args)} 异常: {e}", "WARN")
+        return False
+
+
 def restart_warp():
     log("正在重启 WARP 以更换 IP...")
     try:
-        old_ip = requests.get("https://api.ipify.org", timeout=10).text
+        old_ip = requests.get("https://api.ipify.org", timeout=6).text.strip()
         log(f"当前 IP: {old_ip}")
     except Exception:
         old_ip = "未知"
-    try:
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "disconnect"],
-                       check=False, timeout=30, capture_output=True)
-        time.sleep(3)
+
+    _safe_warp_cmd(["disconnect"], timeout=10)
+    time.sleep(2)
+
+    if not _safe_warp_cmd(["registration", "delete"], timeout=10):
+        log("删除注册失败（可能未注册），继续...", "WARN")
+    time.sleep(1)
+
+    if not _safe_warp_cmd(["registration", "new"], timeout=15):
+        log("注册新 WARP 节点超时或失败，尝试重启服务...", "WARN")
         try:
-            subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "delete"],
-                           check=True, timeout=30, capture_output=True)
-        except subprocess.CalledProcessError:
-            log("删除注册失败（可能未注册），继续...", "WARN")
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "new"],
-                       check=True, timeout=30, capture_output=True)
-        time.sleep(3)
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "connect"],
-                       check=True, timeout=30, capture_output=True)
-        time.sleep(10)
-        new_ip = requests.get("https://api.ipify.org", timeout=10).text
+            subprocess.run(["sudo", "systemctl", "restart", "warp-svc"],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+            time.sleep(3)
+            _safe_warp_cmd(["registration", "new"], timeout=12)
+        except Exception:
+            pass
+
+    time.sleep(2)
+    _safe_warp_cmd(["connect"], timeout=12)
+    time.sleep(6)
+
+    try:
+        new_ip = requests.get("https://api.ipify.org", timeout=8).text.strip()
         log(f"WARP 重连成功，新 IP: {new_ip}")
         return True
     except Exception as e:
-        log(f"WARP 重连失败: {e}", "ERROR")
+        log(f"WARP 连接后网络不通 ({e})，断开 WARP 恢复默认网络继续执行...", "WARN")
+        _safe_warp_cmd(["disconnect"], timeout=10)
+        time.sleep(3)
         return False
 
 
@@ -131,7 +178,7 @@ def take_screenshot(sb, account_index: int, suffix: str) -> str:
 
 # ====================== 广告弹窗与引导遮罩屏蔽 ======================
 def block_ads_modals(sb):
-    """屏蔽干扰性弹窗，并关闭新手引导与 Cookie 遮罩（注意：仅在登录成功后调用）"""
+    """屏蔽干扰性弹窗，并关闭新手引导与 Cookie 遮罩（仅在登录成功后调用）"""
     css = """
     .wisp-offer-modal, .instagram-modal, .qc-cmp2-summary-section,
     #qc-cmp2-container, .qc-cmp2-container {
@@ -148,7 +195,6 @@ def block_ads_modals(sb):
     except Exception as e:
         log(f"注入屏蔽 CSS 失败: {e}", "WARN")
 
-    # 尝试点击新手引导的 "Skip" / "跳过" 以及移除 Cookie 遮罩（不使用 return 语句）
     try:
         sb.execute_script('''
             var cmp = document.getElementById('qc-cmp2-container');
@@ -165,7 +211,7 @@ def block_ads_modals(sb):
         pass
 
 
-# ====================== Turnstile 处理（严格保持原版逻辑）======================
+# ====================== Turnstile 处理 ======================
 def check_turnstile_solved(sb) -> bool:
     """检查当前页面/弹窗中的 Turnstile 是否已完成"""
     try:
@@ -312,7 +358,8 @@ def _get_page_situation(sb) -> str:
     except Exception:
         return 'unknown'
 
-    if "reward-video" in current_url or "reward_video" in current_url:
+    # 检查 URL 路径是否为广告页（兼容 venatus-reward-demo-prod 和 reward-video）
+    if is_ad_or_reward_url(current_url):
         return 'reward'
 
     try:
@@ -447,24 +494,38 @@ def _click_watch_ad_btn(sb) -> bool:
 
 
 def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
+    """
+    等待广告观看完成。
+    注意：因为广告页 URL 为 /client/venatus-reward-demo-prod?return=.../servers/{id}/console，
+    必须检查 urlparse(current_url).path 而不是整个 current_url，否则会在第 0 秒误判已回到控制台！
+    """
     safe_id = mask_server_id(identifier)
     log(f"广告开始播放，等待完成（最长 {timeout}s）: {safe_id}")
     start = time.time()
-    console_path = f"/servers/{identifier}/console"
 
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
         try:
+            # 檢查是否有無廣告 Alert 彈窗
+            if _dismiss_alert_if_present(sb):
+                log(f"✅ 广告播放期间处理了 Alert 弹窗: {safe_id}")
+                time.sleep(3)
+
             current_url = sb.get_current_url()
 
+            # 信号1: URL 含 rewardDone=1
             if "rewardDone=1" in current_url:
-                log(f"✅ 广告完成 [rewardDone]: {safe_id}")
+                log(f"✅ 广告完成 [rewardDone=1]: {safe_id}")
+                time.sleep(3)
                 return True
 
-            if console_path in current_url:
-                log(f"✅ 广告完成 [回到控制台]: {safe_id}")
+            # 信号2: URL 的主路径（不含 ?return= 参数）真正回到了控制台
+            if is_console_url(current_url, identifier):
+                log(f"✅ 广告完成 [已跳转回控制台]: {safe_id}")
+                time.sleep(3)
                 return True
 
+            # 信号3: embedStatus 显示完成文字
             try:
                 status_info = sb.execute_script('''
                     var st = document.getElementById('embedStatus');
@@ -477,21 +538,28 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
                 ''')
                 if status_info and status_info.get('visible'):
                     text = status_info.get('text', '').lower()
-                    if any(kw in text for kw in ['starting', 'saving', 'returning', 'session']):
+                    if any(kw in text for kw in ['starting', 'saving', 'returning', 'session', 'complete', 'redirect']):
                         log(f"✅ 广告完成 [embedStatus='{text[:50]}']: {safe_id}")
-                        time.sleep(8)
+                        # 等待页面自动跳转回控制台（最多等 20 秒）
+                        for _ in range(20):
+                            if is_console_url(sb.get_current_url(), identifier):
+                                log("✅ 已自动跳转回控制台")
+                                break
+                            time.sleep(1)
                         return True
             except Exception:
                 pass
 
-            if "reward-video" not in current_url and elapsed > 10:
+            # 信号4: 页面主路径已离开广告页
+            if not is_ad_or_reward_url(current_url) and elapsed > 10:
                 situation = _get_page_situation(sb)
                 if situation not in ('reward', 'adblocker', 'unknown'):
                     log(f"✅ 广告完成 [页面已跳转到: {current_url[:80]}]: {safe_id}")
                     return True
 
-            if elapsed % 15 == 0:
-                log(f"等待广告完成... [{elapsed}s] URL={current_url[:60]}")
+            if elapsed % 10 == 0:
+                path_only = urlparse(current_url).path
+                log(f"正在观看广告... [{elapsed}s] 当前路径={path_only}")
 
         except Exception as e:
             log(f"广告完成检测异常: {e}", "WARN")
@@ -552,7 +620,7 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
             return True
 
         current_url = sb.get_current_url()
-        if "reward-video" not in current_url:
+        if not is_ad_or_reward_url(current_url):
             log(f"广告页面已自动跳转: {current_url[:80]}")
             return True
 
@@ -574,7 +642,7 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
     return True
 
 
-# ====================== 登录流程（100% 保持原版登录逻辑）======================
+# ====================== 登录流程 ======================
 def login(sb, email: str, password: str) -> bool:
     log("访问登录页...")
     sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
@@ -647,7 +715,6 @@ def login(sb, email: str, password: str) -> bool:
     if not dashboard_ready:
         log("仪表盘结构未识别，但继续执行", "WARN")
 
-    # 等待 2 秒再次清理可能延迟弹出的新手欢迎引导框
     time.sleep(2)
     block_ads_modals(sb)
 
@@ -684,7 +751,6 @@ def get_servers(sb) -> List[str]:
     except Exception as e:
         log(f"fetch 请求失败: {e}", "ERROR")
 
-    # 备用 DOM 提取
     try:
         dom_ids = sb.execute_script('''
             var cards = document.querySelectorAll(
@@ -705,13 +771,8 @@ def get_servers(sb) -> List[str]:
     return []
 
 
-# ====================== 点击启动按钮辅助函数（无 return 循环语法错误）======================
+# ====================== 点击启动按钮辅助函数 ======================
 def try_click_start_button(sb) -> bool:
-    """
-    在当前页面（控制台或仪表盘）尝试点击 Start / Restart / [▷] 按钮。
-    采用 execute_async_script 避免 SeleniumBase 包装多行同步脚本时的 Illegal return statement。
-    """
-    # 1. 先试原生 SeleniumBase 选择器
     for btn_sel, btn_name in [
         ('button#start-btn', 'Start(#start-btn)'),
         ('button#restart-btn', 'Restart(#restart-btn)'),
@@ -726,7 +787,6 @@ def try_click_start_button(sb) -> bool:
         except Exception:
             continue
 
-    # 2. 使用 execute_async_script 查找并点击（绝不会触发 Illegal return statement）
     try:
         res = sb.execute_async_script('''
             var done = arguments[arguments.length - 1];
@@ -782,14 +842,6 @@ def try_click_start_button(sb) -> bool:
 
 # ====================== 重启服务器（完整流程）======================
 def restart_server(sb, identifier: str) -> bool:
-    """
-    完整重启流程：
-    1. 先尝试在仪表盘直接点击 [▷] 快捷启动按钮，或导航到控制台点击 Start/Restart
-    2. 处理广告流程（reward video / alert / adblocker）
-    3. 确保回到控制台页面
-    4. 处理 CF Turnstile 验证弹窗
-    5. 轮询服务器状态
-    """
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
     log(f"{'─'*40}")
@@ -819,43 +871,42 @@ def restart_server(sb, identifier: str) -> bool:
         clicked = try_click_start_button(sb)
 
     if not clicked:
-        log("未找到 Start/Restart 按钮（可能服务器无需手动启动或按钮已隐藏）", "WARN")
-        # 不直接退出，继续去检查一下服务器当前状态是否已经是 running
+        log("未找到 Start/Restart 按钮", "ERROR")
+        return False
 
     # 等待页面响应
     time.sleep(3)
 
     # ── Step 3: 处理广告流程 ──
-    if clicked:
-        log("=== 开始处理广告流程 ===")
-        handle_reward_ad_flow(sb, identifier, console_url)
-        log("=== 广告流程处理完毕 ===")
+    log("=== 开始处理广告流程 ===")
+    handle_reward_ad_flow(sb, identifier, console_url)
+    log("=== 广告流程处理完毕 ===")
 
-        # ── Step 4: 确保回到控制台页面 ──
-        time.sleep(2)
-        current_url = sb.get_current_url()
-        if identifier not in current_url or "reward" in current_url:
-            log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
-            sb.get(console_url)
-            time.sleep(5)
-            block_ads_modals(sb)
-        else:
-            log("当前在控制台页面，无需重新导航")
-            block_ads_modals(sb)
-
-        # ── Step 5: 处理 CF Turnstile 验证弹窗 ──
-        log("=== 开始处理 CF Turnstile 验证 ===")
-        cf_result = handle_restart_turnstile_modal(sb, timeout=90)
-        if not cf_result:
-            log("CF Turnstile 验证失败", "WARN")
-        else:
-            log("=== CF Turnstile 验证完成 ===")
-
+    # ── Step 4: 确保回到控制台页面 ──
+    time.sleep(2)
+    current_url = sb.get_current_url()
+    if not is_console_url(current_url, identifier) or is_ad_or_reward_url(current_url):
+        log(f"当前不在控制台页面（{current_url[:80]}），重新导航...")
+        sb.get(console_url)
+        time.sleep(5)
         block_ads_modals(sb)
+    else:
+        log("当前在控制台页面，无需重新导航")
+        block_ads_modals(sb)
+
+    # ── Step 5: 处理 CF Turnstile 验证弹窗 ──
+    log("=== 开始处理 CF Turnstile 验证 ===")
+    cf_result = handle_restart_turnstile_modal(sb, timeout=90)
+    if not cf_result:
+        log("CF Turnstile 验证失败", "WARN")
+    else:
+        log("=== CF Turnstile 验证完成 ===")
+
+    block_ads_modals(sb)
 
     # ── Step 6: 轮询服务器状态 ──
     log(f"开始轮询服务器状态（最长 60 秒）: {safe_id}")
-    poll_timeout = 60 if clicked else 15
+    poll_timeout = 60
     poll_interval = 5
     start_poll = time.time()
 
@@ -929,7 +980,7 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                 suffix = f"done-{si}" if len(servers) > 1 else "done"
                 screenshot = take_screenshot(sb, idx, suffix)
                 status_icon = "✅" if success else "❌"
-                status_text = "重启成功" if success else "重启失败（已完成登录保活）"
+                status_text = "重启成功" if success else "重启失败"
                 caption = (
                     f"{status_icon} {status_text}\n\n"
                     f"账号: {mask_email(email)}\n"
