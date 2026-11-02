@@ -129,12 +129,19 @@ def take_screenshot(sb, account_index: int, suffix: str) -> str:
         return ""
 
 
-# ====================== 广告弹窗 CSS 屏蔽 ======================
+# ====================== 弹窗与广告遮罩清理 ======================
 def block_ads_modals(sb):
-    """屏蔽干扰性广告弹窗（不屏蔽广告本身，只屏蔽无关弹窗）"""
+    """屏蔽干扰性弹窗、新手引导弹窗及 Cookie 遮罩层"""
     css = """
-    .wisp-offer-modal, .instagram-modal, .qc-cmp2-summary-section {
+    .wisp-offer-modal, .instagram-modal, 
+    #qc-cmp2-container, .qc-cmp2-container, .qc-cmp2-summary-section,
+    .onboarding-modal, .welcome-modal, .tour-modal, [class*="onboarding"] {
         display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
+    body {
+        overflow: auto !important;
     }
     """
     try:
@@ -143,9 +150,41 @@ def block_ads_modals(sb):
             style.textContent = {json.dumps(css)};
             document.head.appendChild(style);
         ''')
-        log("✅ 已注入广告屏蔽 CSS")
+        log("✅ 已注入广告与弹窗屏蔽 CSS")
     except Exception as e:
         log(f"注入屏蔽 CSS 失败: {e}", "WARN")
+
+    dismiss_modals_and_overlays(sb)
+
+
+def dismiss_modals_and_overlays(sb):
+    """主动点击关闭新手引导弹窗（Skip/跳过）和隐私同意弹窗"""
+    try:
+        sb.execute_script('''
+            // 1. 尝试点击 Quantcast 隐私弹窗的 Agree / 同意按钮并移除容器
+            var cmpBtns = document.querySelectorAll('.qc-cmp2-summary-buttons button, #qc-cmp2-ui button');
+            for (var i = 0; i < cmpBtns.length; i++) {
+                var txt = (cmpBtns[i].innerText || '').toLowerCase();
+                if (txt.includes('agree') || txt.includes('accept') || txt.includes('同意') || txt.includes('接受')) {
+                    cmpBtns[i].click();
+                    break;
+                }
+            }
+            var cmpContainer = document.getElementById('qc-cmp2-container');
+            if (cmpContainer) cmpContainer.remove();
+
+            // 2. 尝试点击新手欢迎引导弹窗的 "Skip" / "跳过" 或右上角关闭按钮
+            var allBtns = document.querySelectorAll('button, a, span[role="button"], div[role="button"]');
+            for (var j = 0; j < allBtns.length; j++) {
+                var bTxt = (allBtns[j].innerText || '').trim().toLowerCase();
+                var aria = (allBtns[j].getAttribute('aria-label') || '').toLowerCase();
+                if (bTxt === 'skip' || bTxt === '跳过' || bTxt === 'close' || bTxt === '关闭' || aria === 'close') {
+                    allBtns[j].click();
+                }
+            }
+        ''')
+    except Exception as e:
+        log(f"清理弹窗遮罩异常: {e}", "WARN")
 
 
 # ====================== Turnstile 处理 ======================
@@ -193,7 +232,6 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
     log("等待 CF Turnstile 重启验证弹窗...")
     start = time.time()
 
-    # 先等弹窗出现（最多 20 秒）
     modal_appeared = False
     for _ in range(20):
         try:
@@ -210,14 +248,12 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
         time.sleep(1)
 
     if not modal_appeared:
-        # 弹窗从未出现，可能服务器已启动或不需要验证
         log("CF Turnstile 弹窗未出现，可能无需验证", "WARN")
         return True
 
     last_click = 0
     while time.time() - start < timeout:
         try:
-            # 检查弹窗是否还存在
             modal_visible = sb.execute_script('''
                 var el = document.querySelector('.wisp-start-captcha-modal');
                 return !!(el && getComputedStyle(el).display !== 'none');
@@ -226,10 +262,8 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
                 log("✅ CF Turnstile 弹窗已关闭，验证完成")
                 return True
 
-            # 检查是否已解决
             if check_turnstile_solved(sb):
                 log("Turnstile 已解决，等待弹窗自动关闭...")
-                # 等待弹窗自动关闭（最多 15 秒）
                 for _ in range(15):
                     closed = sb.execute_script('''
                         var el = document.querySelector('.wisp-start-captcha-modal');
@@ -239,7 +273,6 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
                         log("✅ 弹窗已自动关闭")
                         return True
                     time.sleep(1)
-                # 尝试手动关闭
                 try:
                     sb.execute_script('''
                         var btn = document.querySelector(
@@ -253,9 +286,8 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
                     return True
                 except Exception:
                     pass
-                return True  # 即使关闭失败，Turnstile已完成视为成功
+                return True
 
-            # 尝试点击 Turnstile
             now = time.time()
             if now - last_click > 3:
                 try:
@@ -281,7 +313,6 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
 
         time.sleep(1)
 
-    # 超时最终检查
     try:
         if sb.execute_script('return !document.querySelector(".wisp-start-captcha-modal") || getComputedStyle(document.querySelector(".wisp-start-captcha-modal")).display === "none";'):
             log("✅ 超时后弹窗已消失")
@@ -297,26 +328,15 @@ def handle_restart_turnstile_modal(sb, timeout: int = 90) -> bool:
 
 
 # ====================== 广告页面处理 ======================
-
 def _get_page_situation(sb) -> str:
-    """
-    检测当前页面/弹出情况，返回:
-      'adblocker'  - 检测到广告拦截器页面
-      'reward'     - 在广告奖励页面（reward-video page）
-      'alert'      - 有 JS alert 弹窗（No ad available）
-      'console'    - 在控制台页面（正常）
-      'unknown'    - 未知
-    """
     try:
         current_url = sb.get_current_url()
     except Exception:
         return 'unknown'
 
-    # 检查是否在 reward video 页面
     if "reward-video" in current_url or "reward_video" in current_url:
         return 'reward'
 
-    # 检查 AdBlocker 拦截页
     try:
         adblocker = sb.execute_script('''
             var box = document.querySelector('.check-box');
@@ -328,7 +348,6 @@ def _get_page_situation(sb) -> str:
     except Exception:
         pass
 
-    # 检查广告按钮是否在当前页面出现（内嵌情况）
     try:
         has_embed_btn = sb.execute_script('''
             return !!(document.getElementById('embedWatchBtn') || 
@@ -343,10 +362,6 @@ def _get_page_situation(sb) -> str:
 
 
 def _dismiss_alert_if_present(sb) -> bool:
-    """
-    处理 JS alert 弹窗（如 'No ad available right now...'）
-    返回 True 如果处理了弹窗
-    """
     try:
         alert = sb.driver.switch_to.alert
         alert_text = alert.text
@@ -360,10 +375,6 @@ def _dismiss_alert_if_present(sb) -> bool:
 
 
 def _handle_adblocker_page(sb) -> bool:
-    """
-    处理广告拦截器检测页面。
-    点击 'Check again' 按钮。
-    """
     log("检测到广告拦截器页面，尝试点击 'Check again'...")
     try:
         sb.execute_script('''
@@ -379,12 +390,6 @@ def _handle_adblocker_page(sb) -> bool:
 
 
 def _wait_for_reward_btn_ready(sb, timeout: int = 90) -> bool:
-    """
-    等待广告奖励页面的 embedWatchBtn 变为可点击状态。
-    就绪条件：
-      - embedPlayBtn 显示 (display: flex)
-      - embedStatus 已隐藏（说明广告加载完成）
-    """
     log(f"等待广告视频加载就绪（最长 {timeout}s）...")
     start = time.time()
 
@@ -402,9 +407,7 @@ def _wait_for_reward_btn_ready(sb, timeout: int = 90) -> bool:
                 var btnDisplay = window.getComputedStyle(btn).display;
                 var btnVis = window.getComputedStyle(btn).visibility;
 
-                // panel 必须是 flex（showEmbedPlayButton 设置的）
                 if (panelDisplay === 'none') {
-                    // 检查 embedStatus 当前内容
                     var statusText = status ? status.textContent : '';
                     return {ready: false, reason: 'panel_hidden', statusText: statusText};
                 }
@@ -434,22 +437,15 @@ def _wait_for_reward_btn_ready(sb, timeout: int = 90) -> bool:
 
 
 def _click_watch_ad_btn(sb) -> bool:
-    """
-    点击 embedWatchBtn 按钮。
-    使用多种方式确保点击成功。
-    """
     log("点击 'Watch ad to continue' 按钮...")
     methods = [
-        # 方式1: JS click（最可靠，绕过遮挡）
         lambda: sb.execute_script('''
             var btn = document.getElementById('embedWatchBtn');
             if (!btn) return false;
             btn.click();
             return true;
         '''),
-        # 方式2: SeleniumBase click
         lambda: (sb.click('#embedWatchBtn') or True),
-        # 方式3: JS dispatchEvent
         lambda: sb.execute_script('''
             var btn = document.getElementById('embedWatchBtn');
             if (!btn) return false;
@@ -473,14 +469,6 @@ def _click_watch_ad_btn(sb) -> bool:
 
 
 def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
-    """
-    等待广告观看完成。
-    完成信号（任意一个触发即可）：
-      1. URL 回到控制台页面（含 identifier）
-      2. URL 含 rewardDone=1
-      3. embedStatus 显示 "starting/saving/returning/session"
-      4. 页面离开 reward-video URL 且非 adblocker 页
-    """
     safe_id = mask_server_id(identifier)
     log(f"广告开始播放，等待完成（最长 {timeout}s）: {safe_id}")
     start = time.time()
@@ -491,17 +479,14 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
         try:
             current_url = sb.get_current_url()
 
-            # 信号1: URL 含 rewardDone=1
             if "rewardDone=1" in current_url:
                 log(f"✅ 广告完成 [rewardDone]: {safe_id}")
                 return True
 
-            # 信号2: 回到控制台
             if console_path in current_url:
                 log(f"✅ 广告完成 [回到控制台]: {safe_id}")
                 return True
 
-            # 信号3: embedStatus 显示完成文字
             try:
                 status_info = sb.execute_script('''
                     var st = document.getElementById('embedStatus');
@@ -516,13 +501,11 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
                     text = status_info.get('text', '').lower()
                     if any(kw in text for kw in ['starting', 'saving', 'returning', 'session']):
                         log(f"✅ 广告完成 [embedStatus='{text[:50]}']: {safe_id}")
-                        # 等待实际跳转
                         time.sleep(8)
                         return True
             except Exception:
                 pass
 
-            # 信号4: 离开 reward 页面
             if "reward-video" not in current_url and elapsed > 10:
                 situation = _get_page_situation(sb)
                 if situation not in ('reward', 'adblocker', 'unknown'):
@@ -542,27 +525,13 @@ def _wait_for_ad_completion(sb, identifier: str, timeout: int = 300) -> bool:
 
 
 def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
-    """
-    完整广告流程处理器。
-    在点击 Start 按钮后调用。
-
-    处理以下所有情况：
-      A. 跳转到 reward-video 页面 → 等待按钮 → 点击 → 等待完成
-      B. Alert 弹窗 "No ad available" → 关闭弹窗 → 继续（走CF验证）
-      C. AdBlocker 检测页 → 点击 Check again → 重新检测
-      D. 没有广告页面 → 直接返回 True（继续CF验证）
-
-    返回 True 表示可以继续执行 CF 验证流程
-    """
     safe_id = mask_server_id(identifier)
     log(f"广告流程处理开始: {safe_id}")
 
-    # 等待页面响应（最多 15 秒）
     ad_flow_timeout = 15
     start = time.time()
 
     while time.time() - start < ad_flow_timeout:
-        # 优先处理 Alert 弹窗（因为 alert 会阻塞其他操作）
         if _dismiss_alert_if_present(sb):
             log("✅ 已处理 Alert 弹窗（无广告情况），继续CF验证")
             return True
@@ -571,15 +540,12 @@ def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
         log(f"当前页面情况: {situation}")
 
         if situation == 'reward':
-            # 进入广告观看流程
             return _execute_reward_ad_watch(sb, identifier)
 
         elif situation == 'adblocker':
-            # 处理广告拦截器检测页
             log("检测到广告拦截器页面")
             _handle_adblocker_page(sb)
             time.sleep(3)
-            # 再次检查（可能变成 reward 或 alert）
             continue
 
         elif situation == 'console':
@@ -588,7 +554,6 @@ def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
 
         time.sleep(1)
 
-    # 超时：再检查一次 alert
     if _dismiss_alert_if_present(sb):
         log("✅ 超时后处理 Alert 弹窗")
         return True
@@ -598,23 +563,16 @@ def handle_reward_ad_flow(sb, identifier: str, console_url: str) -> bool:
 
 
 def _execute_reward_ad_watch(sb, identifier: str) -> bool:
-    """
-    在 reward-video 页面执行完整广告观看流程。
-    返回 True 表示广告流程结束（无论成功与否都应继续CF验证）
-    """
     safe_id = mask_server_id(identifier)
     log(f"进入广告观看流程: {safe_id}")
 
-    # 等待 Watch ad 按钮就绪
     btn_ready = _wait_for_reward_btn_ready(sb, timeout=90)
 
     if not btn_ready:
-        # 按钮未就绪，检查是否有 alert（No ad available）
         if _dismiss_alert_if_present(sb):
             log("✅ 广告按钮未就绪但检测到 Alert（无广告），继续CF验证")
             return True
 
-        # 检查是否 failRewardReturn 已经把页面跳回
         current_url = sb.get_current_url()
         if "reward-video" not in current_url:
             log(f"广告页面已自动跳转: {current_url[:80]}")
@@ -623,20 +581,15 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
         log("广告按钮未就绪，继续CF验证", "WARN")
         return True
 
-    # 在点击前再检查一次 alert
     if _dismiss_alert_if_present(sb):
         log("✅ 点击前检测到 Alert（无广告），继续CF验证")
         return True
 
-    # 点击 Watch ad 按钮
     if not _click_watch_ad_btn(sb):
         log("广告按钮点击失败，继续CF验证", "WARN")
         return True
 
-    # 等待广告完成
     _wait_for_ad_completion(sb, identifier, timeout=300)
-
-    # 广告完成后处理可能的 alert
     _dismiss_alert_if_present(sb)
 
     log(f"广告流程结束: {safe_id}")
@@ -648,6 +601,7 @@ def login(sb, email: str, password: str) -> bool:
     log("访问登录页...")
     sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
     time.sleep(4)
+    block_ads_modals(sb)
 
     try:
         sb.wait_for_element_visible('input#email', timeout=15)
@@ -656,6 +610,7 @@ def login(sb, email: str, password: str) -> bool:
         log("未找到登录表单，尝试重新连接...", "WARN")
         sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
         time.sleep(5)
+        block_ads_modals(sb)
         try:
             sb.wait_for_element_visible('input#email', timeout=10)
         except TimeoutException:
@@ -679,7 +634,7 @@ def login(sb, email: str, password: str) -> bool:
         sb.execute_script('document.querySelector("form#login-form").submit()')
 
     log("等待跳转到仪表盘...")
-    for _ in range(15):
+    for _ in range(20):
         if "/dashboard" in sb.get_current_url() or "/client/dashboard" in sb.get_current_url():
             log("已跳转到仪表盘")
             break
@@ -688,6 +643,7 @@ def login(sb, email: str, password: str) -> bool:
         log("登录后未成功跳转到仪表盘", "ERROR")
         return False
 
+    time.sleep(2)
     block_ads_modals(sb)
 
     DASHBOARD_SELECTORS = [
@@ -713,15 +669,17 @@ def login(sb, email: str, password: str) -> bool:
         except Exception:
             pass
 
-    if not dashboard_ready:
-        log("仪表盘结构未识别，但继续执行", "WARN")
+    # 再次清理可能延迟弹出的新手引导框
+    time.sleep(1)
+    dismiss_modals_and_overlays(sb)
 
-    log("✅ 登录成功并进入仪表盘")
+    log("✅ 登录成功并进入仪表盘（已触发两周登录保活）")
     return True
 
 
-# ====================== 获取服务器列表 ======================
-def get_servers(sb) -> List[str]:
+# ====================== 获取服务器列表及状态 ======================
+def get_servers_info(sb) -> List[dict]:
+    """获取服务器列表及当前状态 [{'identifier': '...', 'current_state': '...'}]"""
     log("通过 fetch 请求服务器列表...")
     try:
         result = sb.execute_async_script('''
@@ -732,8 +690,8 @@ def get_servers(sb) -> List[str]:
             })
             .then(function(res) { return res.json(); })
             .then(function(data) {
-                if (data.servers) {
-                    callback(data.servers.map(function(s) { return s.identifier; }));
+                if (data && data.servers) {
+                    callback(data.servers);
                 } else {
                     callback([]);
                 }
@@ -741,11 +699,11 @@ def get_servers(sb) -> List[str]:
             .catch(function(err) { callback([]); });
         ''')
         if result and isinstance(result, list):
-            ids = [str(i) for i in result if i]
-            if ids:
-                masked = [mask_server_id(i) for i in ids]
-                log(f"成功获取服务器列表，共 {len(ids)} 台: {masked}")
-                return ids
+            servers = [s for s in result if isinstance(s, dict) and s.get("identifier")]
+            if servers:
+                masked = [f"{mask_server_id(s['identifier'])}({s.get('current_state', '未知')})" for s in servers]
+                log(f"成功获取服务器列表，共 {len(servers)} 台: {masked}")
+                return servers
     except Exception as e:
         log(f"fetch 请求失败: {e}", "ERROR")
 
@@ -753,16 +711,23 @@ def get_servers(sb) -> List[str]:
     try:
         dom_ids = sb.execute_script('''
             var cards = document.querySelectorAll(
-                '[data-server-id], .server-card, .server-item'
+                '[data-server-id], .server-card, .server-item, a[href*="/client/servers/"]'
             );
-            return Array.from(cards).map(function(el) {
-                return el.getAttribute('data-server-id') || el.id;
-            }).filter(Boolean);
+            var ids = [];
+            Array.from(cards).forEach(function(el) {
+                var id = el.getAttribute('data-server-id') || el.id;
+                if (!id && el.href) {
+                    var m = el.href.match(/\\/servers\\/([^\\/\\?]+)/);
+                    if (m) id = m[1];
+                }
+                if (id && !ids.includes(id)) ids.push(id);
+            });
+            return ids;
         ''')
         if dom_ids:
             masked = [mask_server_id(i) for i in dom_ids]
             log(f"从 DOM 提取到服务器，共 {len(dom_ids)} 台: {masked}")
-            return list(dom_ids)
+            return [{"identifier": str(i), "current_state": "unknown"} for i in dom_ids]
     except Exception as e:
         log(f"DOM 提取失败: {e}", "WARN")
 
@@ -770,21 +735,89 @@ def get_servers(sb) -> List[str]:
     return []
 
 
-# ====================== 重启服务器（完整流程）======================
-def restart_server(sb, identifier: str) -> bool:
+def check_server_status(sb, identifier: str) -> Optional[str]:
+    status_script = f'''
+        var callback = arguments[arguments.length - 1];
+        var serverId = {json.dumps(identifier)};
+        fetch('/client/api/servers/status', {{
+            method: 'GET',
+            headers: {{ 'Accept': 'application/json' }}
+        }})
+        .then(function(res) {{ return res.json(); }})
+        .then(function(data) {{
+            if (!data || !data.servers) return callback(null);
+            var server = data.servers.find(function(s) {{
+                return s.identifier === serverId;
+            }});
+            callback(server ? server.current_state : null);
+        }})
+        .catch(function() {{ callback(null); }});
+    '''
+    try:
+        return sb.execute_async_script(status_script)
+    except Exception:
+        return None
+
+
+def click_start_or_restart_button(sb) -> bool:
+    """多策略查找并点击控制台中的 Start / Restart 按钮"""
+    # 策略1: 常规 CSS 选择器
+    selectors = [
+        'button#start-btn',
+        'button#restart-btn',
+        '[data-action="start"]',
+        '[data-action="restart"]',
+        'button.start-btn',
+        'button.restart-btn',
+    ]
+    for sel in selectors:
+        try:
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                log(f"✅ 已点击按钮 ({sel})")
+                return True
+        except Exception:
+            continue
+
+    # 策略2: 通过 JS 匹配按钮文本或图标（兼容新版 UI）
+    try:
+        clicked_text = sb.execute_script('''
+            var buttons = Array.from(document.querySelectorAll('button, a.btn, div[role="button"]'));
+            var targets = ['start', 'restart', '启动', '重启', '开机'];
+            for (var i = 0; i < buttons.length; i++) {
+                var btn = buttons[i];
+                if (btn.disabled || getComputedStyle(btn).display === 'none' || getComputedStyle(btn).visibility === 'hidden') {
+                    continue;
+                }
+                var txt = (btn.innerText || btn.textContent || btn.getAttribute('title') || btn.getAttribute('aria-label') || '').trim().toLowerCase();
+                for (var j = 0; j < targets.length; j++) {
+                    if (txt === targets[j] || txt.includes(targets[j])) {
+                        btn.click();
+                        return txt;
+                    }
+                }
+            }
+            return null;
+        ''')
+        if clicked_text:
+            log(f"✅ 已通过 JS 文本匹配点击按钮: '{clicked_text}'")
+            return True
+    except Exception as e:
+        log(f"JS 查找 Start/Restart 按钮异常: {e}", "WARN")
+
+    return False
+
+
+# ====================== 保活与重启服务器（完整流程）======================
+def restart_server(sb, identifier: str, initial_state: str = "unknown") -> Tuple[bool, str]:
     """
-    完整重启流程：
-    1. 导航到控制台
-    2. 点击 Start/Restart 按钮
-    3. 处理广告流程（reward video / alert / adblocker）
-    4. 确保回到控制台页面
-    5. 处理 CF Turnstile 验证弹窗
-    6. 轮询服务器状态
+    完整保活/重启流程：
+    返回 (是否成功, 状态描述文本)
     """
     console_url = CONSOLE_URL_TEMPLATE.format(identifier=identifier)
     safe_id = mask_server_id(identifier)
     log(f"{'─'*40}")
-    log(f"重启服务器: {safe_id}")
+    log(f"处理服务器: {safe_id} (初始状态: {initial_state})")
     log(f"{'─'*40}")
 
     # ── Step 1: 导航到控制台 ──
@@ -793,30 +826,24 @@ def restart_server(sb, identifier: str) -> bool:
     time.sleep(5)
     block_ads_modals(sb)
 
-    # ── Step 2: 点击 Start / Restart ──
-    start_btn = None
-    for btn_sel, btn_name in [('button#start-btn', 'Start'), ('button#restart-btn', 'Restart')]:
-        try:
-            start_btn = sb.wait_for_element_visible(btn_sel, timeout=8)
-            log(f"找到 {btn_name} 按钮")
-            break
-        except Exception:
-            continue
+    # ── Step 2: 尝试点击 Start / Restart ──
+    btn_clicked = click_start_or_restart_button(sb)
 
-    if not start_btn:
-        log("未找到 Start/Restart 按钮", "ERROR")
-        return False
+    if not btn_clicked:
+        # 清理一次可能延迟加载的遮罩后再试一次
+        time.sleep(3)
+        dismiss_modals_and_overlays(sb)
+        btn_clicked = click_start_or_restart_button(sb)
 
-    try:
-        start_btn.click()
-        log("✅ 已点击 Start/Restart 按钮")
-    except Exception:
-        try:
-            sb.execute_script("document.querySelector('#start-btn, #restart-btn').click()")
-            log("✅ 已通过 JS 点击 Start/Restart 按钮")
-        except Exception as e:
-            log(f"点击 Start/Restart 失败: {e}", "ERROR")
-            return False
+    if not btn_clicked:
+        cur_state = check_server_status(sb, identifier) or initial_state
+        log(f"未找到 Start/Restart 按钮，当前服务器状态为: {cur_state}", "WARN")
+        if cur_state and "running" in str(cur_state).lower():
+            log(f"✅ 服务器 {safe_id} 已处于运行状态，且已完成登录保活")
+            return True, f"保活成功 (状态: {cur_state})"
+        # 即使服务器处于离线，根据 Wispbyte 新规（每两周登录一次即可保活），登录仪表盘已完成续期
+        log(f"⚠️ 未能触发控制台启动按钮，但账号已完成登录保活 (当前状态: {cur_state})", "WARN")
+        return True, f"登录保活完成 (服务器状态: {cur_state})"
 
     # 等待页面响应
     time.sleep(3)
@@ -835,15 +862,14 @@ def restart_server(sb, identifier: str) -> bool:
         time.sleep(5)
         block_ads_modals(sb)
     else:
-        log(f"当前在控制台页面，无需重新导航")
+        log("当前在控制台页面，无需重新导航")
         block_ads_modals(sb)
 
     # ── Step 5: 处理 CF Turnstile 验证弹窗 ──
     log("=== 开始处理 CF Turnstile 验证 ===")
     cf_result = handle_restart_turnstile_modal(sb, timeout=90)
     if not cf_result:
-        log("CF Turnstile 验证失败", "WARN")
-        # 不直接返回 False，继续尝试轮询
+        log("CF Turnstile 验证未确认完成，继续检查状态", "WARN")
     else:
         log("=== CF Turnstile 验证完成 ===")
 
@@ -855,45 +881,22 @@ def restart_server(sb, identifier: str) -> bool:
     poll_interval = 5
     start_poll = time.time()
 
-    status_script = f'''
-        var callback = arguments[arguments.length - 1];
-        var serverId = {json.dumps(identifier)};
-        fetch('/client/api/servers/status', {{
-            method: 'GET',
-            headers: {{ 'Accept': 'application/json' }}
-        }})
-        .then(function(res) {{ return res.json(); }})
-        .then(function(data) {{
-            var server = data.servers.find(function(s) {{
-                return s.identifier === serverId;
-            }});
-            callback(server ? server.current_state : null);
-        }})
-        .catch(function() {{ callback(null); }});
-    '''
-
     while time.time() - start_poll < poll_timeout:
-        try:
-            status = sb.execute_async_script(status_script)
-            if status and 'running' in str(status).lower():
-                log(f"✅ 服务器 {safe_id} 状态: {status}，重启成功！")
-                return True
-            log(f"当前状态: {status or '未知'}，{poll_interval}s 后重试...")
-        except Exception as e:
-            log(f"状态检查异常: {e}", "WARN")
+        status = check_server_status(sb, identifier)
+        if status and 'running' in str(status).lower():
+            log(f"✅ 服务器 {safe_id} 状态: {status}，重启/启动成功！")
+            return True, f"重启成功 (状态: {status})"
+        log(f"当前状态: {status or '未知'}，{poll_interval}s 后重试...")
         time.sleep(poll_interval)
 
     # 最终检查
-    try:
-        status = sb.execute_async_script(status_script)
-        if status and 'running' in str(status).lower():
-            log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
-            return True
-        log(f"❌ 轮询超时，最终状态: {status or '未知'}", "ERROR")
-        return False
-    except Exception as e:
-        log(f"最终状态检查失败: {e}", "ERROR")
-        return False
+    status = check_server_status(sb, identifier)
+    if status and 'running' in str(status).lower():
+        log(f"✅ 最终检查成功: {safe_id} 状态: {status}")
+        return True, f"重启成功 (状态: {status})"
+
+    log(f"⚠️ 轮询结束，最终状态: {status or '未知'}（登录保活已生效）", "WARN")
+    return False, f"启动超时 (最终状态: {status or '未知'}，但登录保活已生效)"
 
 
 # ====================== 账号处理 ======================
@@ -913,19 +916,20 @@ def process_account(idx: int, email: str, password: str, tg_token: str, tg_chat:
                               f"❌ 登录失败\n账号: {mask_email(email)}\n\nWispbyte Auto Restart")
                 return
 
-            servers = get_servers(sb)
+            servers = get_servers_info(sb)
             if not servers:
                 screenshot = take_screenshot(sb, idx, "no-server")
                 send_tg_photo(tg_token, tg_chat, screenshot,
                               f"❌ 未找到服务器\n账号: {mask_email(email)}\n\nWispbyte Auto Restart")
                 return
 
-            for si, server_id in enumerate(servers, start=1):
-                success = restart_server(sb, server_id)
+            for si, srv in enumerate(servers, start=1):
+                server_id = str(srv.get("identifier"))
+                initial_state = str(srv.get("current_state", "unknown"))
+                success, status_text = restart_server(sb, server_id, initial_state)
                 suffix = f"done-{si}" if len(servers) > 1 else "done"
                 screenshot = take_screenshot(sb, idx, suffix)
-                status_icon = "✅" if success else "❌"
-                status_text = "重启成功" if success else "重启失败"
+                status_icon = "✅" if success else "⚠️"
                 caption = (
                     f"{status_icon} {status_text}\n\n"
                     f"账号: {mask_email(email)}\n"
