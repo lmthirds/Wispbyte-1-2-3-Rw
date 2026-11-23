@@ -643,28 +643,120 @@ def _execute_reward_ad_watch(sb, identifier: str) -> bool:
 
 
 # ====================== 登录流程 ======================
+def _find_visible_selector(sb, selectors: List[str], timeout: int = 15) -> Optional[str]:
+    """轮询多个候选 CSS 选择器，返回第一个可见的元素选择器"""
+    start = time.time()
+    while time.time() - start < timeout:
+        for sel in selectors:
+            try:
+                if sb.is_element_visible(sel):
+                    return sel
+            except Exception:
+                continue
+        time.sleep(0.5)
+    return None
+
+
+def _click_login_submit(sb, pwd_sel: str) -> bool:
+    """兼容新版/旧版登录页的提交按钮点击"""
+    for sel in ('button[type="submit"]', 'button.login-btn', 'form button[type="submit"]'):
+        try:
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                log(f"✅ 已点击登录按钮 ({sel})")
+                return True
+        except Exception:
+            continue
+
+    # 按按钮文本精准匹配 "Log in" / "Sign in"（避开 Discord/Google/GitHub 快捷登录按钮）
+    try:
+        clicked = sb.execute_script('''
+            var btns = document.querySelectorAll('button, input[type="submit"]');
+            for (var i = 0; i < btns.length; i++) {
+                var el = btns[i];
+                var st = window.getComputedStyle(el);
+                if (el.disabled || st.display === 'none' || st.visibility === 'hidden') continue;
+                var txt = (el.innerText || el.value || '').trim().toLowerCase();
+                if (txt === 'log in' || txt === 'login' || txt === 'sign in') {
+                    el.click();
+                    return true;
+                }
+            }
+            var form = document.querySelector('form');
+            if (form) {
+                if (form.requestSubmit) form.requestSubmit();
+                else form.submit();
+                return true;
+            }
+            return false;
+        ''')
+        if clicked:
+            log("✅ 已通过文本/表单提交登录")
+            return True
+    except Exception as e:
+        log(f"JS 提交登录异常: {e}", "WARN")
+
+    # 兜底：在密码框直接按回车提交
+    try:
+        sb.type(pwd_sel, "\n")
+        log("✅ 已通过回车提交登录")
+        return True
+    except Exception:
+        return False
+
+
 def login(sb, email: str, password: str) -> bool:
+    EMAIL_SELECTORS = [
+        'input[type="email"]',
+        'input#email',
+        'input[name="email"]',
+        'input[autocomplete="email"]',
+        'input[autocomplete="username"]',
+        'input[placeholder*="email" i]',
+        'form input[type="text"]',
+    ]
+    PASSWORD_SELECTORS = [
+        'input[type="password"]',
+        'input#password',
+        'input[name="password"]',
+        'input[autocomplete="current-password"]',
+    ]
+
     log("访问登录页...")
     sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
     time.sleep(4)
 
-    try:
-        sb.wait_for_element_visible('input#email', timeout=15)
-        log("✅ 找到登录表单")
-    except TimeoutException:
+    email_sel = _find_visible_selector(sb, EMAIL_SELECTORS, timeout=15)
+    if not email_sel:
         log("未找到登录表单，尝试重新连接...", "WARN")
         sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=10)
         time.sleep(5)
+        email_sel = _find_visible_selector(sb, EMAIL_SELECTORS, timeout=12)
+
+    if not email_sel:
         try:
-            sb.wait_for_element_visible('input#email', timeout=10)
-        except TimeoutException:
-            log("仍然未找到登录表单", "ERROR")
-            return False
+            inputs_info = sb.execute_script('''
+                return Array.from(document.querySelectorAll('input')).map(function(el) {
+                    return {tag: el.tagName, type: el.type, id: el.id, name: el.name, placeholder: el.placeholder};
+                });
+            ''')
+            log(f"页面现有 input 列表: {inputs_info}", "WARN")
+        except Exception:
+            pass
+        log("仍然未找到邮箱输入框", "ERROR")
+        return False
+
+    pwd_sel = _find_visible_selector(sb, PASSWORD_SELECTORS, timeout=10)
+    if not pwd_sel:
+        log("未找到密码输入框", "ERROR")
+        return False
+
+    log(f"✅ 找到登录表单 (email={email_sel}, password={pwd_sel})")
 
     log("填写登录信息...")
-    sb.type('input#email', email)
+    sb.type(email_sel, email)
     time.sleep(0.5)
-    sb.type('input#password', password)
+    sb.type(pwd_sel, password)
     time.sleep(0.5)
 
     if not wait_for_turnstile_success(sb, timeout=35):
@@ -672,10 +764,9 @@ def login(sb, email: str, password: str) -> bool:
         return False
 
     log("提交登录...")
-    try:
-        sb.click('button.login-btn')
-    except Exception:
-        sb.execute_script('document.querySelector("form#login-form").submit()')
+    if not _click_login_submit(sb, pwd_sel):
+        log("提交登录失败", "ERROR")
+        return False
 
     log("等待跳转到仪表盘...")
     for _ in range(15):
